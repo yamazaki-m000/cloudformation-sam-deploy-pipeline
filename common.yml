@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - none
+      - dev
+      - stg
+    Default: none
+Mappings:
+  Iam:
+    dev:
+      PutablePolicyToSrc: '19cyber-dev-bucket-putable-policy'
+      KickGlueJobRoleName:  '19cyber-dev-lambda-kick-glue-job-role'
+    stg:
+      PutablePolicyToSrc: '19cyber-stg-bucket-putable-policy'
+      KickGlueJobRoleName:  '19cyber-stg-lambda-kick-glue-job-role'
+
+
+#################################################
+# Resources
+#################################################
+Resources:
+  #################################################
+  # CodePipeline IAM
+  #################################################
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  CodePipelineServiceRolePolicies:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-pipeline-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CodeBuildPolicy
+            Effect: Allow
+            Action:
+              - "codebuild:BatchGetBuilds"
+              - "codebuild:StartBuild"
+            Resource:
+              - "*"
+          - Sid: S3Policy
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+            Resource:
+              - !Sub ${ArtifactStore.Arn}
+              - !Sub ${ArtifactStore.Arn}/*
+          - Action:
+              - apigateway:*
+            Resource: "*"
+            Effect: Allow
+      Roles:
+        - !Ref CodePipelineServiceRole
+
+  #################################################
+  # CodeBuild IAM
+  #################################################
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  PutableToSrcPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !FindInMap [Iam, !Ref Env, PutablePolicyToSrc]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Join
+                - '-'
+                - - 'arn:aws:s3:::19cyber'
+                  - !Ref Env
+                  - 'src/*'
+              - !Join
+                - '-'
+                - - 'arn:aws:s3:::19cyber'
+                  - !Ref Env
+                  - 'common-rtc/*'
+      Roles:
+        - !Ref CodeBuildServiceRole
+
+  CodeBuildServiceRolePolicies:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-build-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LambdaPolicy
+            Effect: Allow
+            Action:
+              - lambda:*
+            Resource:
+              - "*"
+          - Sid: CloudWatchLogsPolicy
+            Effect: Allow
+            Action:
+              - logs:*
+            Resource:
+              - "*"
+          - Sid: S3Policy
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+            Resource:
+              - !Sub ${ArtifactStore.Arn}
+              - !Sub ${ArtifactStore.Arn}/*
+              - !Sub ${LogBucket.Arn}
+              - !Sub ${LogBucket.Arn}/*
+          - Sid: SSMParameter
+            Action:
+              - ssm:GetParameters
+            Effect: Allow
+            Resource:
+              - "*"
+          - Action:
+              - cloudformation:CreateStack
+              - cloudformation:DeleteStack
+              - cloudformation:DescribeStacks
+              - cloudformation:UpdateStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:SetStackPolicy
+              - cloudformation:ValidateTemplate
+              - cloudformation:GetTemplateSummary
+            Resource: "*"
+            Effect: Allow
+          - Action:
+              - iam:CreateRole
+              - iam:AttachRolePolicy
+              - iam:PassRole
+              - iam:DetachRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRole
+              - iam:DeleteRolePolicy
+              - iam:GetRole
+            Resource: "*"
+            Effect: Allow
+          - Action:
+              - apigateway:*
+            Resource: "*"
+            Effect: Allow
+      Roles:
+        - !Ref CodeBuildServiceRole
+
+  #################################################
+  # S3
+  #################################################
+  ArtifactStore:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-artifactstore-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 400
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-logs-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 400
+
+  #################################################
+  # CloudWatch Logs
+  #################################################
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "codebuild/${AWS::StackName}/"
+      RetentionInDays: 14
+
+  KickGlueJobFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !FindInMap [Iam, !Ref Env, KickGlueJobRoleName]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+#################################################
+# Outputs
+#################################################
+Outputs:
+  CodePipelineServiceRoleArn:
+    Value: !Sub ${CodePipelineServiceRole.Arn}
+    Export:
+      Name: !Sub ${AWS::StackName}-codepipeline-service-role-arn
+  CodeBuildServiceRoleName:
+    Value: !Ref CodeBuildServiceRole
+    Export:
+      Name: !Sub ${AWS::StackName}-codebuild-service-role-name
+  ArtifactStoreName:
+    Value: !Ref ArtifactStore
+    Export:
+      Name: !Sub ${AWS::StackName}-artifactstore-name
+  LogGroupName:
+    Value: !Ref LogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-loggroup-name
+  LogBucketName:
+    Value: !Ref LogBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-logbucket-name

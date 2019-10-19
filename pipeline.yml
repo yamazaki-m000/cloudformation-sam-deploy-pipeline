@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+#################################################
+# Parameters
+#################################################
+Parameters:
+  CommonStackName:
+    Type: String
+  ComputeType:
+    Type: String
+    AllowedValues:
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+    Default: BUILD_GENERAL1_SMALL
+    Description: Enter BUILD_GENERAL1_SMALL, BUILD_GENERAL1_MEDIUM, or BUILD_GENERAL1_LARGE. Default is BUILD_GENERAL1_SMALL.
+  Image:
+    Type: String
+    Default: aws/codebuild/standard:2.0
+
+  ApplicationName:
+    Type: String
+  GitHubOwner:
+    Type: String
+    Description: GitHub Owner Name
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub Token
+  GitHubRepository:
+    Type: String
+    Description: GitHub Repository
+  Branch:
+    Type: String
+    Default: master
+    Description: GitHub Branch
+Conditions:
+  BranchCondition: !Equals [ !Ref Branch, "master" ]
+Resources:
+  #################################################
+  # CodeBuild
+  #################################################
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${CommonStackName}-${ApplicationName}
+      Artifacts:
+        Type: CODEPIPELINE
+      Cache:
+        Modes:
+          - LOCAL_CUSTOM_CACHE
+        Type: LOCAL
+      Description: "sam package and deploy"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName:
+            Fn::ImportValue: !Sub "${CommonStackName}-loggroup-name"
+          StreamName: !Sub "${ApplicationName}"
+        S3Logs:
+          Status: ENABLED
+          EncryptionDisabled: false
+          Location:
+            Fn::Join:
+              - "/"
+              - - Fn::ImportValue: !Sub "${CommonStackName}-logbucket-name"
+                - !Sub "${ApplicationName}"
+      Environment:
+        ComputeType: !Ref ComputeType
+        EnvironmentVariables:
+          - Name: S3_BUCKET_NAME
+            Value:
+              Fn::ImportValue: !Sub "${CommonStackName}-artifactstore-name"
+          - Name: STACK_NAME
+            Value: !Sub ${CommonStackName}-${ApplicationName}
+          - Name: UPLOAD_STAGE
+            Value: !If [ BranchCondition, "prd", !Ref Branch ]
+        Image: !Ref Image
+        Type: LINUX_CONTAINER
+        PrivilegedMode: True
+      ServiceRole:
+        Fn::ImportValue: !Sub "${CommonStackName}-codebuild-service-role-name"
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 20
+
+  ################################################
+  # SecretsManager
+  ################################################
+  GitHubWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-WebhookSecret"
+      Description: !Sub "https://github.com/${GitHubOwner}/${GitHubRepository}/settings/hooks"
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: "SecretToken"
+        ExcludePunctuation: true
+        PasswordLength: 40
+
+  ################################################
+  # CodePipeline
+  ################################################
+  PipelineWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken:
+          !Join [
+            "",
+            [
+              "{{resolve:secretsmanager:",
+              !Ref GitHubWebhookSecret,
+              ":SecretString:SecretToken}}",
+            ],
+          ]
+      Filters:
+        - JsonPath: "$.ref"
+          MatchEquals: refs/heads/{Branch}
+      TargetPipeline: !Ref CodePipeline
+      TargetAction: SourceAction
+      Name: !Sub "${AWS::StackName}-CodePipelineWebhook"
+      TargetPipelineVersion: !Sub ${CodePipeline.Version}
+      RegisterWithThirdParty: true
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location:
+          Fn::ImportValue: !Sub "${CommonStackName}-artifactstore-name"
+        Type: S3
+      Name: !Sub ${AWS::StackName}-pipeline
+      RestartExecutionOnUpdate: false
+      RoleArn:
+        Fn::ImportValue: !Sub "${CommonStackName}-codepipeline-service-role-arn"
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: "1"
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepository
+                Branch: !Ref Branch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: false
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              RunOrder: 1
+
+
+#################################################
+# Outputs
+#################################################
+Outputs:
+  SourceRepositoryURL:
+    Value: !Sub "https://github.com/${GitHubOwner}/${GitHubRepository}/"
